@@ -4,8 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"maps"
+	"slices"
 	"testing"
 
+	ghcontext "github.com/github/github-mcp-server/pkg/context"
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +42,7 @@ func testToolsetMetadataWithDefault(id string, isDefault bool) ToolsetMetadata {
 
 // mockToolWithDefault creates a mock tool with a default toolset flag
 func mockToolWithDefault(name string, toolsetID string, readOnly bool, isDefault bool) ServerTool {
-	return NewServerToolFromHandler(
+	return NewServerTool(
 		mcp.Tool{
 			Name: name,
 			Annotations: &mcp.ToolAnnotations{
@@ -47,17 +51,15 @@ func mockToolWithDefault(name string, toolsetID string, readOnly bool, isDefault
 			InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
 		},
 		testToolsetMetadataWithDefault(toolsetID, isDefault),
-		func(_ any) mcp.ToolHandler {
-			return func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return nil, nil
-			}
+		func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, nil
 		},
 	)
 }
 
 // mockTool creates a minimal ServerTool for testing
 func mockTool(name string, toolsetID string, readOnly bool) ServerTool {
-	return NewServerToolFromHandler(
+	return NewServerTool(
 		mcp.Tool{
 			Name: name,
 			Annotations: &mcp.ToolAnnotations{
@@ -66,10 +68,8 @@ func mockTool(name string, toolsetID string, readOnly bool) ServerTool {
 			InputSchema: json.RawMessage(`{"type":"object","properties":{}}`),
 		},
 		testToolsetMetadata(toolsetID),
-		func(_ any) mcp.ToolHandler {
-			return func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return nil, nil
-			}
+		func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, nil
 		},
 	)
 }
@@ -466,21 +466,6 @@ func TestToolsetDescriptions(t *testing.T) {
 	}
 }
 
-func TestToolsForToolset(t *testing.T) {
-	tools := []ServerTool{
-		mockTool("tool1", "toolset1", true),
-		mockTool("tool2", "toolset1", true),
-		mockTool("tool3", "toolset2", true),
-	}
-
-	reg := mustBuild(t, NewBuilder().SetTools(tools))
-	toolset1Tools := reg.ToolsForToolset("toolset1")
-
-	if len(toolset1Tools) != 2 {
-		t.Fatalf("Expected 2 tools for toolset1, got %d", len(toolset1Tools))
-	}
-}
-
 func TestWithDeprecatedAliases(t *testing.T) {
 	tools := []ServerTool{
 		mockTool("new_name", "toolset1", true),
@@ -639,30 +624,6 @@ func TestHasToolset(t *testing.T) {
 	}
 	if reg.HasToolset("nonexistent") {
 		t.Error("expected HasToolset to return false for non-existent toolset")
-	}
-}
-
-func TestEnabledToolsetIDs(t *testing.T) {
-	tools := []ServerTool{
-		mockTool("tool1", "toolset1", true),
-		mockTool("tool2", "toolset2", true),
-	}
-
-	// Without filter, all toolsets are enabled
-	reg := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}))
-	ids := reg.EnabledToolsetIDs()
-	if len(ids) != 2 {
-		t.Fatalf("Expected 2 enabled toolset IDs, got %d", len(ids))
-	}
-
-	// With filter
-	filtered := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"toolset1"}))
-	filteredIDs := filtered.EnabledToolsetIDs()
-	if len(filteredIDs) != 1 {
-		t.Fatalf("Expected 1 enabled toolset ID, got %d", len(filteredIDs))
-	}
-	if filteredIDs[0] != "toolset1" {
-		t.Errorf("Expected toolset1, got %s", filteredIDs[0])
 	}
 }
 
@@ -1090,7 +1051,9 @@ func TestMCPMethodConstants(t *testing.T) {
 func mockToolWithFlags(name string, toolsetID string, readOnly bool, enableFlag, disableFlag string) ServerTool {
 	tool := mockTool(name, toolsetID, readOnly)
 	tool.FeatureFlagEnable = enableFlag
-	tool.FeatureFlagDisable = disableFlag
+	if disableFlag != "" {
+		tool.FeatureFlagDisable = []string{disableFlag}
+	}
 	return tool
 }
 
@@ -1100,22 +1063,22 @@ func TestFeatureFlagEnable(t *testing.T) {
 		mockToolWithFlags("needs_flag", "toolset1", true, "my_feature", ""),
 	}
 
-	// Without feature checker, tool with FeatureFlagEnable should be excluded
+	// Without feature checker, feature-flag filtering is skipped: both tools pass
 	reg := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}))
 	available := reg.AvailableTools(context.Background())
-	if len(available) != 1 {
-		t.Fatalf("Expected 1 tool without feature checker, got %d", len(available))
-	}
-	if available[0].Tool.Name != "always_available" {
-		t.Errorf("Expected always_available, got %s", available[0].Tool.Name)
+	if len(available) != 2 {
+		t.Fatalf("Expected 2 tools without feature checker (filtering skipped), got %d", len(available))
 	}
 
-	// With feature checker returning false, tool should still be excluded
+	// With feature checker returning false, FeatureFlagEnable tool is excluded
 	checkerFalse := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	regFalse := mustBuild(t, NewBuilder().SetTools(tools).WithToolsets([]string{"all"}).WithFeatureChecker(checkerFalse))
 	availableFalse := regFalse.AvailableTools(context.Background())
 	if len(availableFalse) != 1 {
 		t.Fatalf("Expected 1 tool with false checker, got %d", len(availableFalse))
+	}
+	if availableFalse[0].Tool.Name != "always_available" {
+		t.Errorf("Expected always_available, got %s", availableFalse[0].Tool.Name)
 	}
 
 	// With feature checker returning true for "my_feature", tool should be included
@@ -1210,11 +1173,11 @@ func TestFeatureFlagResources(t *testing.T) {
 		},
 	}
 
-	// Without checker, resource with enable flag should be excluded
+	// Without checker, feature-flag filtering is skipped: both resources pass
 	reg := mustBuild(t, NewBuilder().SetResources(resources).WithToolsets([]string{"all"}))
 	available := reg.AvailableResourceTemplates(context.Background())
-	if len(available) != 1 {
-		t.Fatalf("Expected 1 resource without checker, got %d", len(available))
+	if len(available) != 2 {
+		t.Fatalf("Expected 2 resources without checker (filtering skipped), got %d", len(available))
 	}
 
 	// With checker returning true, both should be included
@@ -1235,11 +1198,11 @@ func TestFeatureFlagPrompts(t *testing.T) {
 		},
 	}
 
-	// Without checker, prompt with enable flag should be excluded
+	// Without checker, feature-flag filtering is skipped: both prompts pass
 	reg := mustBuild(t, NewBuilder().SetPrompts(prompts).WithToolsets([]string{"all"}))
 	available := reg.AvailablePrompts(context.Background())
-	if len(available) != 1 {
-		t.Fatalf("Expected 1 prompt without checker, got %d", len(available))
+	if len(available) != 2 {
+		t.Fatalf("Expected 2 prompts without checker (filtering skipped), got %d", len(available))
 	}
 
 	// With checker returning true, both should be included
@@ -1525,9 +1488,11 @@ func TestEnabledAndFeatureFlagInteraction(t *testing.T) {
 	}
 
 	// Feature flag not enabled - tool should be excluded despite Enabled returning true
+	checkerOff := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	reg1 := mustBuild(t, NewBuilder().
 		SetTools([]ServerTool{tool}).
-		WithToolsets([]string{"all"}))
+		WithToolsets([]string{"all"}).
+		WithFeatureChecker(checkerOff))
 	available1 := reg1.AvailableTools(context.Background())
 	if len(available1) != 0 {
 		t.Error("Tool should be excluded when feature flag is not enabled")
@@ -1693,10 +1658,10 @@ func TestFilteredToolsMatchesAvailableTools(t *testing.T) {
 func TestFilteringOrder(t *testing.T) {
 	// Test that filters are applied in the correct order:
 	// 1. Tool.Enabled
-	// 2. Feature flags
-	// 3. Read-only
-	// 4. Builder filters
-	// 5. Toolset/additional tools
+	// 2. Read-only
+	// 3. Builder filters (feature-flag filter is at the head of this list
+	//    when WithFeatureChecker is set)
+	// 4. Toolset/additional tools
 
 	callOrder := []string{}
 
@@ -1729,8 +1694,9 @@ func TestFilteringOrder(t *testing.T) {
 
 	_ = reg.AvailableTools(context.Background())
 
-	// Expected order: Enabled, FeatureFlag, ReadOnly (stops here because it's write tool)
-	expectedOrder := []string{"Enabled", "FeatureFlag"}
+	// Expected order: Enabled, then Read-only stops (write tool, read-only mode);
+	// neither the feature-flag filter nor the user filter is reached.
+	expectedOrder := []string{"Enabled"}
 	if len(callOrder) != len(expectedOrder) {
 		t.Errorf("Expected %d checks, got %d: %v", len(expectedOrder), len(callOrder), callOrder)
 	}
@@ -1753,16 +1719,18 @@ func TestForMCPRequest_ToolsCall_FeatureFlaggedVariants(t *testing.T) {
 	}
 
 	// Test 1: Flag is OFF - first tool variant should be available
+	checkerOff := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	regFlagOff := mustBuild(t, NewBuilder().
 		SetTools(tools).
-		WithToolsets([]string{"all"}))
+		WithToolsets([]string{"all"}).
+		WithFeatureChecker(checkerOff))
 	filteredOff := regFlagOff.ForMCPRequest(MCPMethodToolsCall, "get_job_logs")
 	availableOff := filteredOff.AvailableTools(context.Background())
 	if len(availableOff) != 1 {
 		t.Fatalf("Flag OFF: Expected 1 tool, got %d", len(availableOff))
 	}
-	if availableOff[0].FeatureFlagDisable != "consolidated_flag" {
-		t.Errorf("Flag OFF: Expected tool with FeatureFlagDisable, got FeatureFlagEnable=%q, FeatureFlagDisable=%q",
+	if len(availableOff[0].FeatureFlagDisable) != 1 || availableOff[0].FeatureFlagDisable[0] != "consolidated_flag" {
+		t.Errorf("Flag OFF: Expected tool with FeatureFlagDisable, got FeatureFlagEnable=%q, FeatureFlagDisable=%v",
 			availableOff[0].FeatureFlagEnable, availableOff[0].FeatureFlagDisable)
 	}
 
@@ -1780,7 +1748,7 @@ func TestForMCPRequest_ToolsCall_FeatureFlaggedVariants(t *testing.T) {
 		t.Fatalf("Flag ON: Expected 1 tool, got %d", len(availableOn))
 	}
 	if availableOn[0].FeatureFlagEnable != "consolidated_flag" {
-		t.Errorf("Flag ON: Expected tool with FeatureFlagEnable, got FeatureFlagEnable=%q, FeatureFlagDisable=%q",
+		t.Errorf("Flag ON: Expected tool with FeatureFlagEnable, got FeatureFlagEnable=%q, FeatureFlagDisable=%v",
 			availableOn[0].FeatureFlagEnable, availableOn[0].FeatureFlagDisable)
 	}
 }
@@ -1805,11 +1773,13 @@ func TestWithTools_DeprecatedAliasAndFeatureFlag(t *testing.T) {
 
 	// Test 1: Flag OFF - old_tool should be available via direct name match
 	// (not via alias resolution to new_tool, since old_tool still exists)
+	checkerOff := func(_ context.Context, _ string) (bool, error) { return false, nil }
 	regFlagOff := mustBuild(t, NewBuilder().
 		SetTools(tools).
 		WithDeprecatedAliases(deprecatedAliases).
 		WithToolsets([]string{}).        // No toolsets enabled
-		WithTools([]string{"old_tool"})) // Explicitly request old tool
+		WithTools([]string{"old_tool"}). // Explicitly request old tool
+		WithFeatureChecker(checkerOff))
 	availableOff := regFlagOff.AvailableTools(context.Background())
 	if len(availableOff) != 1 {
 		t.Fatalf("Flag OFF: Expected 1 tool, got %d", len(availableOff))
@@ -1839,7 +1809,7 @@ func TestWithTools_DeprecatedAliasAndFeatureFlag(t *testing.T) {
 
 // mockToolWithMeta creates a ServerTool with Meta for testing insiders mode
 func mockToolWithMeta(name string, toolsetID string, meta map[string]any) ServerTool {
-	return NewServerToolFromHandler(
+	return NewServerTool(
 		mcp.Tool{
 			Name: name,
 			Annotations: &mcp.ToolAnnotations{
@@ -1849,10 +1819,8 @@ func mockToolWithMeta(name string, toolsetID string, meta map[string]any) Server
 			Meta:        meta,
 		},
 		testToolsetMetadata(toolsetID),
-		func(_ any) mcp.ToolHandler {
-			return func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
-				return nil, nil
-			}
+		func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, nil
 		},
 	)
 }
@@ -1863,18 +1831,16 @@ func TestWithMCPApps_DisabledStripsUIMetadata(t *testing.T) {
 		"description": "kept",
 	})
 
-	// Default: MCP Apps is disabled - UI meta should be stripped
+	// Default: MCP Apps is disabled - UI meta should be stripped on registration.
 	reg := mustBuild(t, NewBuilder().SetTools([]ServerTool{toolWithUI}).WithToolsets([]string{"all"}))
-	available := reg.AvailableTools(context.Background())
+	registered := captureRegisteredTools(context.Background(), t, reg)
 
-	require.Len(t, available, 1)
-	// UI metadata should be stripped
-	if available[0].Tool.Meta["ui"] != nil {
+	require.Len(t, registered, 1)
+	if registered[0].Meta["ui"] != nil {
 		t.Errorf("Expected 'ui' meta to be stripped, but it was present")
 	}
-	// Other metadata should be preserved
-	if available[0].Tool.Meta["description"] != "kept" {
-		t.Errorf("Expected 'description' meta to be preserved, got %v", available[0].Tool.Meta["description"])
+	if registered[0].Meta["description"] != "kept" {
+		t.Errorf("Expected 'description' meta to be preserved, got %v", registered[0].Meta["description"])
 	}
 }
 
@@ -1947,7 +1913,6 @@ func TestWithMCPApps_ToolsWithoutUIMetaUnaffected(t *testing.T) {
 }
 
 func TestWithMCPApps_UIOnlyMetaBecomesNil(t *testing.T) {
-	// Tool with ONLY ui metadata - should become nil after stripping when MCP Apps is disabled
 	toolUIOnly := mockToolWithMeta("tool_ui_only", "toolset1", map[string]any{
 		"ui": map[string]any{"html": "<div>hello</div>"},
 	})
@@ -1955,12 +1920,11 @@ func TestWithMCPApps_UIOnlyMetaBecomesNil(t *testing.T) {
 	reg := mustBuild(t, NewBuilder().
 		SetTools([]ServerTool{toolUIOnly}).
 		WithToolsets([]string{"all"}))
-	available := reg.AvailableTools(context.Background())
+	registered := captureRegisteredTools(context.Background(), t, reg)
 
-	require.Len(t, available, 1)
-	// Meta should be nil since ui was the only key and MCP Apps is off by default
-	if available[0].Tool.Meta != nil {
-		t.Errorf("Expected Meta to be nil after stripping only key, got %v", available[0].Tool.Meta)
+	require.Len(t, registered, 1)
+	if registered[0].Meta != nil {
+		t.Errorf("Expected Meta to be nil after stripping only key, got %v", registered[0].Meta)
 	}
 }
 
@@ -2056,6 +2020,267 @@ func TestStripMCPAppsMetadata(t *testing.T) {
 
 	// tool3: unchanged (nil)
 	require.Nil(t, result[2].Tool.Meta)
+}
+
+// mockToolWithSchema creates a ServerTool with the given *jsonschema.Schema as
+// InputSchema. Used to exercise schema-based strip helpers.
+func mockToolWithSchema(name string, toolsetID string, schema *jsonschema.Schema) ServerTool {
+	return NewServerTool(
+		mcp.Tool{
+			Name: name,
+			Annotations: &mcp.ToolAnnotations{
+				ReadOnlyHint: true,
+			},
+			InputSchema: schema,
+		},
+		testToolsetMetadata(toolsetID),
+		func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+			return nil, nil
+		},
+	)
+}
+
+func TestStripSchemaProperties(t *testing.T) {
+	tests := []struct {
+		name           string
+		schema         any
+		keys           []string
+		expectChange   bool
+		wantProperties []string // property names expected to remain (order-independent)
+		wantRequired   []string // required fields expected to remain (order-independent)
+	}{
+		{
+			name:         "nil schema - no change",
+			schema:       nil,
+			keys:         []string{"show_ui"},
+			expectChange: false,
+		},
+		{
+			name:         "RawMessage schema - skipped (not a *jsonschema.Schema)",
+			schema:       json.RawMessage(`{"type":"object","properties":{"show_ui":{"type":"boolean"}}}`),
+			keys:         []string{"show_ui"},
+			expectChange: false,
+		},
+		{
+			name: "schema without the key - no change",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner": {Type: "string"},
+				},
+			},
+			keys:         []string{"show_ui"},
+			expectChange: false,
+		},
+		{
+			name:         "empty keys list - no change",
+			schema:       &jsonschema.Schema{Type: "object", Properties: map[string]*jsonschema.Schema{"show_ui": {Type: "boolean"}}},
+			keys:         []string{},
+			expectChange: false,
+		},
+		{
+			name: "schema with the key - stripped, others preserved",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner":   {Type: "string"},
+					"repo":    {Type: "string"},
+					"show_ui": {Type: "boolean"},
+				},
+				Required: []string{"owner", "repo"},
+			},
+			keys:           []string{"show_ui"},
+			expectChange:   true,
+			wantProperties: []string{"owner", "repo"},
+			wantRequired:   []string{"owner", "repo"},
+		},
+		{
+			name: "key in required list is also stripped",
+			schema: &jsonschema.Schema{
+				Type: "object",
+				Properties: map[string]*jsonschema.Schema{
+					"owner":   {Type: "string"},
+					"show_ui": {Type: "boolean"},
+				},
+				Required: []string{"owner", "show_ui"},
+			},
+			keys:           []string{"show_ui"},
+			expectChange:   true,
+			wantProperties: []string{"owner"},
+			wantRequired:   []string{"owner"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tool := NewServerTool(
+				mcp.Tool{
+					Name:        "test",
+					Annotations: &mcp.ToolAnnotations{ReadOnlyHint: true},
+					InputSchema: tt.schema,
+				},
+				testToolsetMetadata("toolset1"),
+				func(_ context.Context, _ *mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+					return nil, nil
+				},
+			)
+
+			result := stripSchemaProperties(tool, tt.keys)
+
+			if !tt.expectChange {
+				require.Nil(t, result, "expected no change but got result")
+				return
+			}
+
+			require.NotNil(t, result, "expected change but got nil")
+			schema, ok := result.Tool.InputSchema.(*jsonschema.Schema)
+			require.True(t, ok, "result schema should remain *jsonschema.Schema")
+			require.ElementsMatch(t, tt.wantProperties, slices.Collect(maps.Keys(schema.Properties)))
+			require.ElementsMatch(t, tt.wantRequired, schema.Required)
+
+			// Original schema must not be mutated.
+			origSchema := tt.schema.(*jsonschema.Schema)
+			_, stillThere := origSchema.Properties["show_ui"]
+			require.True(t, stillThere || !slices.Contains(tt.keys, "show_ui"), "original schema should not be mutated")
+		})
+	}
+}
+
+func TestStripUIOnlySchemaProperties(t *testing.T) {
+	tools := []ServerTool{
+		mockToolWithSchema("with_show_ui", "toolset1", &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"owner":   {Type: "string"},
+				"show_ui": {Type: "boolean"},
+			},
+		}),
+		mockToolWithSchema("without_show_ui", "toolset1", &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"owner": {Type: "string"},
+			},
+		}),
+		mockTool("raw_schema_tool", "toolset1", true), // InputSchema is json.RawMessage
+	}
+
+	result := stripUIOnlySchemaProperties(tools)
+	require.Len(t, result, 3)
+
+	stripped := result[0].Tool.InputSchema.(*jsonschema.Schema)
+	require.NotContains(t, stripped.Properties, "show_ui",
+		"show_ui should be stripped from a tool that declares it")
+	require.Contains(t, stripped.Properties, "owner",
+		"other properties on the same schema must be preserved")
+
+	// Tool without show_ui: same value returned (no allocation), schema untouched.
+	require.Same(t, tools[1].Tool.InputSchema, result[1].Tool.InputSchema,
+		"tools without the gated property must be returned unchanged")
+
+	// Tool with an opaque (json.RawMessage) schema: passed through untouched.
+	require.Equal(t, tools[2].Tool.InputSchema, result[2].Tool.InputSchema,
+		"tools with a non-*jsonschema.Schema input schema must be passed through")
+}
+
+// TestConditionalSchemaPropertyDescriptions ensures every property that
+// inventory strips per-request also has a human-readable condition the doc
+// generator can render. A future addition to uiOnlySchemaProperties that
+// forgets to wire a description through will fail here.
+func TestConditionalSchemaPropertyDescriptions(t *testing.T) {
+	t.Parallel()
+
+	descs := ConditionalSchemaPropertyDescriptions()
+	require.NotEmpty(t, descs, "expected at least show_ui to be advertised as conditional")
+
+	for _, name := range uiOnlySchemaProperties {
+		desc, ok := descs[name]
+		require.Truef(t, ok, "ui-only property %q must have a conditional description", name)
+		require.NotEmptyf(t, desc, "conditional description for %q must be non-empty", name)
+	}
+}
+
+func TestToolsForRegistration_StripsShowUIUnderSameGate(t *testing.T) {
+	// A tool whose schema declares both `_meta.ui` and `show_ui`. The strip
+	// for both must fire — or not — together, governed by the same gate
+	// already covered by TestShouldStripMCPAppsMetadata.
+	makeTool := func() ServerTool {
+		st := mockToolWithSchema("ui_tool", "toolset1", &jsonschema.Schema{
+			Type: "object",
+			Properties: map[string]*jsonschema.Schema{
+				"owner":   {Type: "string"},
+				"show_ui": {Type: "boolean"},
+			},
+		})
+		st.Tool.Meta = map[string]any{
+			"ui":          map[string]any{"resourceUri": "ui://example"},
+			"description": "kept",
+		}
+		return st
+	}
+
+	mcpAppsChecker := func(_ context.Context, flag string) (bool, error) {
+		return flag == mcpAppsFeatureFlag, nil
+	}
+
+	tests := []struct {
+		name       string
+		ctx        context.Context
+		ffOn       bool
+		wantShowUI bool // expect show_ui to remain in registered schema
+		wantUIMeta bool // expect _meta.ui to remain on registered tool
+	}{
+		{
+			name:       "FF off, capability unknown -> both stripped",
+			ctx:        context.Background(),
+			ffOn:       false,
+			wantShowUI: false,
+			wantUIMeta: false,
+		},
+		{
+			name:       "FF on, capability unknown -> both kept",
+			ctx:        context.Background(),
+			ffOn:       true,
+			wantShowUI: true,
+			wantUIMeta: true,
+		},
+		{
+			name:       "FF on, capability present -> both kept",
+			ctx:        ghcontext.WithUISupport(context.Background(), true),
+			ffOn:       true,
+			wantShowUI: true,
+			wantUIMeta: true,
+		},
+		{
+			name:       "FF on, capability explicitly absent -> both stripped",
+			ctx:        ghcontext.WithUISupport(context.Background(), false),
+			ffOn:       true,
+			wantShowUI: false,
+			wantUIMeta: false,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			builder := NewBuilder().SetTools([]ServerTool{makeTool()}).WithToolsets([]string{"all"})
+			if tc.ffOn {
+				builder = builder.WithFeatureChecker(mcpAppsChecker)
+			}
+			reg := mustBuild(t, builder)
+
+			registered := reg.ToolsForRegistration(tc.ctx)
+			require.Len(t, registered, 1)
+			schema, ok := registered[0].Tool.InputSchema.(*jsonschema.Schema)
+			require.True(t, ok)
+
+			_, hasShowUI := schema.Properties["show_ui"]
+			require.Equal(t, tc.wantShowUI, hasShowUI,
+				"show_ui presence in registered schema should match strip gate")
+
+			_, hasUIMeta := registered[0].Tool.Meta["ui"]
+			require.Equal(t, tc.wantUIMeta, hasUIMeta,
+				"_meta.ui presence on registered tool should match strip gate")
+		})
+	}
 }
 
 func TestStripMetaKeys_MultipleKeys(t *testing.T) {
@@ -2238,4 +2463,72 @@ func TestCreateExcludeToolsFilter(t *testing.T) {
 	allowed, err = filter(context.Background(), &allowedTool)
 	require.NoError(t, err)
 	require.True(t, allowed, "allowed_tool should be included")
+}
+
+// captureRegisteredTools mirrors RegisterTools' per-request strip behavior so
+// tests can verify what the wire sees, without requiring tools to have real
+// handlers (RegisterTools panics on tools without HandlerFunc). It delegates
+// to ToolsForRegistration so any future strip added there is picked up
+// automatically.
+func captureRegisteredTools(ctx context.Context, t *testing.T, reg *Inventory) []*mcp.Tool {
+	t.Helper()
+	forReg := reg.ToolsForRegistration(ctx)
+	out := make([]*mcp.Tool, 0, len(forReg))
+	for i := range forReg {
+		toolCopy := forReg[i].Tool
+		out = append(out, &toolCopy)
+	}
+	return out
+}
+
+// TestShouldStripMCPAppsMetadata verifies the spec-conformant strip decision:
+// strip when the feature flag is off, OR when the client explicitly does not
+// advertise the io.modelcontextprotocol/ui extension.
+func TestShouldStripMCPAppsMetadata(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		setupCtx func() context.Context
+		ffOn     bool
+		want     bool
+	}{
+		{
+			name:     "FF off, capability unknown -> strip",
+			setupCtx: context.Background,
+			ffOn:     false,
+			want:     true,
+		},
+		{
+			name:     "FF off, capability present -> strip (FF wins)",
+			setupCtx: func() context.Context { return ghcontext.WithUISupport(context.Background(), true) },
+			ffOn:     false,
+			want:     true,
+		},
+		{
+			name:     "FF on, capability unknown -> keep",
+			setupCtx: context.Background,
+			ffOn:     true,
+			want:     false,
+		},
+		{
+			name:     "FF on, capability present -> keep",
+			setupCtx: func() context.Context { return ghcontext.WithUISupport(context.Background(), true) },
+			ffOn:     true,
+			want:     false,
+		},
+		{
+			name:     "FF on, capability explicitly absent -> strip",
+			setupCtx: func() context.Context { return ghcontext.WithUISupport(context.Background(), false) },
+			ffOn:     true,
+			want:     true,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := shouldStripMCPAppsMetadata(tc.setupCtx(), tc.ffOn)
+			require.Equal(t, tc.want, got)
+		})
+	}
 }

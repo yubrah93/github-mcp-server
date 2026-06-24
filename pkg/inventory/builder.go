@@ -7,6 +7,8 @@ import (
 	"maps"
 	"slices"
 	"strings"
+
+	"github.com/google/jsonschema-go/jsonschema"
 )
 
 var (
@@ -106,8 +108,7 @@ func (b *Builder) WithServerInstructions() *Builder {
 //   - "default": expands to toolsets marked with Default: true in their metadata
 //
 // Input strings are trimmed of whitespace and duplicates are removed.
-// Pass nil to use default toolsets. Pass an empty slice to disable all toolsets
-// (useful for dynamic toolsets mode where tools are enabled on demand).
+// Pass nil to use default toolsets. Pass an empty slice to disable all toolsets.
 // Returns self for chaining.
 func (b *Builder) WithToolsets(toolsetIDs []string) *Builder {
 	b.toolsetIDs = toolsetIDs
@@ -128,8 +129,20 @@ func (b *Builder) WithTools(toolNames []string) *Builder {
 
 // WithFeatureChecker sets the feature flag checker function.
 // The checker receives a context (for actor extraction) and feature flag name,
-// returns (enabled, error). If error occurs, it will be logged and treated as false.
-// If checker is nil, all feature flag checks return false.
+// and returns (enabled, error). Errors are logged and treated as "not enabled".
+//
+// When the checker is non-nil, Build() installs a feature-flag ToolFilter
+// at the head of the filter pipeline so that tools annotated with
+// FeatureFlagEnable / FeatureFlagDisable are gated accordingly. Resources
+// and prompts use the same checker via an explicit guard at their iteration
+// site.
+//
+// When the checker is nil, no feature-flag filter is installed; tools,
+// resources, and prompts pass through feature-flag gating unchanged. The
+// per-request inventory in HTTP mode must always install a checker so that
+// MCP registration (which can only serve a given tool name once) sees a
+// deduplicated set of dual-name variants.
+//
 // Returns self for chaining.
 func (b *Builder) WithFeatureChecker(checker FeatureFlagChecker) *Builder {
 	b.featureChecker = checker
@@ -190,19 +203,6 @@ func cleanTools(tools []string) []string {
 	return cleaned
 }
 
-// checkFeatureFlag checks a feature flag at build time using the builder's feature checker.
-// Returns false if no checker is configured or the flag is not enabled.
-func (b *Builder) checkFeatureFlag(flag string) bool {
-	if b.featureChecker == nil {
-		return false
-	}
-	enabled, err := b.featureChecker(context.Background(), flag)
-	if err != nil {
-		return false
-	}
-	return enabled
-}
-
 // Build creates the final Inventory with all configuration applied.
 // This processes toolset filtering, tool name resolution, and sets up
 // the inventory for use. The returned Inventory is ready for use with
@@ -214,11 +214,14 @@ func (b *Builder) checkFeatureFlag(flag string) bool {
 func (b *Builder) Build() (*Inventory, error) {
 	tools := b.tools
 
-	// When MCP Apps feature flag is not enabled, strip UI metadata from tools
-	// so clients won't attempt to load UI resources.
-	// The feature checker is the single source of truth for flag evaluation.
-	if !b.checkFeatureFlag(mcpAppsFeatureFlag) {
-		tools = stripMCPAppsMetadata(tools)
+	// Install the feature-flag filter at the head of the pipeline so that
+	// flag-gated tools are excluded before any user-supplied WithFilter sees
+	// them. Doing this in Build() (rather than inside WithFeatureChecker)
+	// keeps the install idempotent — repeated WithFeatureChecker calls
+	// replace the checker without stacking duplicate filters.
+	filters := b.filters
+	if b.featureChecker != nil {
+		filters = append([]ToolFilter{createFeatureFlagFilter(b.featureChecker)}, filters...)
 	}
 
 	r := &Inventory{
@@ -228,7 +231,7 @@ func (b *Builder) Build() (*Inventory, error) {
 		deprecatedAliases: b.deprecatedAliases,
 		readOnly:          b.readOnly,
 		featureChecker:    b.featureChecker,
-		filters:           b.filters,
+		filters:           filters,
 	}
 
 	// Process toolsets and pre-compute metadata in a single pass
@@ -403,6 +406,97 @@ func stripMCPAppsMetadata(tools []ServerTool) []ServerTool {
 		}
 	}
 	return result
+}
+
+// uiOnlySchemaProperties lists input-schema property names that should only
+// be visible to clients that advertise MCP Apps UI support. They live on the
+// static schema (so toolsnaps and the feature-flag / insiders docs document
+// the full UI-capable surface; the main README renders the stripped
+// non-UI schema) and are stripped per-request when the same gate that hides
+// _meta.ui is true.
+var uiOnlySchemaProperties = []string{
+	"show_ui", // explicit "render the MCP App form" toggle on form-backed write tools
+}
+
+// ConditionalSchemaPropertyDescriptions returns a map of schema property name
+// to a human-readable description of the condition under which the property
+// is visible to clients. The doc generator uses this to annotate conditional
+// parameters so readers can see at a glance which fields are not always
+// available. This is the single source of truth for the conditional-property
+// surface — entries here must correspond to a strip rule in
+// ToolsForRegistration.
+func ConditionalSchemaPropertyDescriptions() map[string]string {
+	const uiOnlyCondition = "visible when remote_mcp_ui_apps is enabled unless the client explicitly indicates it does not support io.modelcontextprotocol/ui"
+	out := make(map[string]string, len(uiOnlySchemaProperties))
+	for _, name := range uiOnlySchemaProperties {
+		out[name] = uiOnlyCondition
+	}
+	return out
+}
+
+// stripUIOnlySchemaProperties removes UI-capability-gated input-schema
+// properties (currently just "show_ui") from each tool's static schema.
+// Tools whose InputSchema is not a *jsonschema.Schema (e.g. json.RawMessage)
+// are passed through untouched — no such tool currently declares a gated
+// property, and inferring intent from an opaque schema is not safe.
+// Tools without any gated property are returned as-is so we only allocate
+// when a change is actually made (mirrors the stripMetaKeys pattern).
+func stripUIOnlySchemaProperties(tools []ServerTool) []ServerTool {
+	result := make([]ServerTool, 0, len(tools))
+	for _, tool := range tools {
+		if stripped := stripSchemaProperties(tool, uiOnlySchemaProperties); stripped != nil {
+			result = append(result, *stripped)
+		} else {
+			result = append(result, tool)
+		}
+	}
+	return result
+}
+
+// stripSchemaProperties removes the named keys from tool.Tool.InputSchema's
+// Properties map (and Required list, if present) and returns a modified copy.
+// Returns nil when the schema is not a *jsonschema.Schema or no listed key
+// is present, signalling no change.
+func stripSchemaProperties(tool ServerTool, keys []string) *ServerTool {
+	if tool.Tool.InputSchema == nil || len(keys) == 0 {
+		return nil
+	}
+	schema, ok := tool.Tool.InputSchema.(*jsonschema.Schema)
+	if !ok || schema == nil || len(schema.Properties) == 0 {
+		return nil
+	}
+
+	hasKey := false
+	for _, key := range keys {
+		if _, exists := schema.Properties[key]; exists {
+			hasKey = true
+			break
+		}
+	}
+	if !hasKey {
+		return nil
+	}
+
+	toolCopy := tool
+	schemaCopy := *schema
+	newProps := make(map[string]*jsonschema.Schema, len(schema.Properties))
+	for k, v := range schema.Properties {
+		if !slices.Contains(keys, k) {
+			newProps[k] = v
+		}
+	}
+	schemaCopy.Properties = newProps
+	if len(schemaCopy.Required) > 0 {
+		newRequired := make([]string, 0, len(schemaCopy.Required))
+		for _, r := range schemaCopy.Required {
+			if !slices.Contains(keys, r) {
+				newRequired = append(newRequired, r)
+			}
+		}
+		schemaCopy.Required = newRequired
+	}
+	toolCopy.Tool.InputSchema = &schemaCopy
+	return &toolCopy
 }
 
 // stripMetaKeys removes the specified Meta keys from a single tool.
