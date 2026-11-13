@@ -104,6 +104,18 @@ jobs:
 
       # Build and push Docker image with Buildx (don't push on PR)
       # https://github.com/docker/build-push-action
+      - name: Report Rollouts deployment start
+        if: github.event_name != 'pull_request'
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CHANGE_MONITOR_ENV: "ghcr.io"
+          CHANGE_MONITOR_SERVICE: "github-mcp-server"
+          CHANGE_MONITOR_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          CHANGE_MONITOR_ACTOR: "github-actions:${{ github.run_id }}:${{ github.run_attempt }}:${{ github.workflow }}:${{ github.job }}:github-mcp-server:ghcr.io"
+        run: |
+          export DEPLOY_VERSION="$(git rev-parse HEAD)"
+          bash .github/scripts/rollouts-reporter.sh bootstrap
+          bash .github/scripts/rollouts-reporter.sh start
       - name: Build and push Docker image
         id: build-and-push
         uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
@@ -123,6 +135,16 @@ jobs:
       # repository is public to avoid leaking data.  If you would like to publish
       # transparency data even for private images, pass --force to cosign below.
       # https://github.com/sigstore/cosign
+      - name: Report Rollouts deployment finish
+        if: always() && (github.event_name != 'pull_request')
+        env:
+          CURSOR_API_KEY: ${{ secrets.CURSOR_API_KEY }}
+          CHANGE_MONITOR_ENV: "ghcr.io"
+          CHANGE_MONITOR_SERVICE: "github-mcp-server"
+          CHANGE_MONITOR_SOURCE: ${{ github.server_url }}/${{ github.repository }}
+          CHANGE_MONITOR_ACTOR: "github-actions:${{ github.run_id }}:${{ github.run_attempt }}:${{ github.workflow }}:${{ github.job }}:github-mcp-server:ghcr.io"
+          CHANGE_MONITOR_OUTCOME: ${{ job.status }}
+        run: bash .github/scripts/rollouts-reporter.sh finish
       - name: Sign the published Docker image
         if: ${{ github.event_name != 'pull_request' }}
         env:
